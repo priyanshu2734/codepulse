@@ -1,0 +1,281 @@
+{
+  "SEC-001:config/secrets.js:5": {
+    "how": "The file config/secrets.js exports a module-level config object with apiSecret assigned to a string literal on line 5. Any module that requires this config file — including auth middleware, route handlers, and service code — receives the raw secret value at import time. Because the value is a string literal in source code, it is present in every build artifact, every git commit, and every environment where the code runs.",
+    "why": "Confirmed detection: a string literal matching the pattern sk_live_* was found assigned to apiSecret in a committed config file. Inferred risk: if this repository is accessible to other developers, CI systems, or is ever made public, the secret is fully exposed. Live API keys (sk_live_ prefix) are typically tied to real payment or service accounts — exposure allows unauthorized API calls on behalf of the account holder.",
+    "impact": "The apiSecret value is loaded at startup by any code that requires config/secrets.js. Based on the detected import chain, this includes middleware (auth checks), controllers, services, and any database operation that uses authenticated API calls. Rotating the key requires a deployment; until rotation, any party with access to the source has the same API access as the application.",
+    "fix": {
+      "remediation": "Move the secret to an environment variable. Replace the string literal with process.env.API_SECRET and set the value in a .env file (add .env to .gitignore). Use a library such as dotenv to load it at startup. Rotate the exposed key immediately with your API provider.",
+      "codeChange": "apiSecret: process.env.API_SECRET,",
+      "tests": [
+        "Add a startup check that throws if process.env.API_SECRET is undefined — prevents the app from running without the secret set.",
+        "Write a test that asserts config.apiSecret does not match the hardcoded string literal 'sk_live_4f8g9h2j3k5l6m7n8p9q0r1s'."
+      ]
+    }
+  },
+
+  "SEC-001:config/secrets.js:6": {
+    "how": "stripeKey on line 6 is assigned the string literal sk_live_abcdef… directly in source. The Stripe key prefix sk_live_ indicates this is a live-mode secret key, not a test key. Any process with read access to the source file can extract it without any authentication.",
+    "why": "Confirmed detection: a string literal matching sk_live_ was found. Inferred risk: a live Stripe secret key grants full access to the Stripe account — including creating charges, reading customer data, and issuing refunds. Exposure via source control is one of the most common causes of payment credential compromise.",
+    "impact": "Stripe secret keys cannot be scoped to read-only. Exposure means any holder can create charges, access customer payment methods, and modify subscription data. The key is available to any code path that imports config/secrets.js, including all service and route layers.",
+    "fix": {
+      "remediation": "Replace with process.env.STRIPE_SECRET_KEY. Invalidate the exposed key in the Stripe dashboard immediately under Developers → API keys. Never commit live keys; use sk_test_ keys in development.",
+      "codeChange": "stripeKey: process.env.STRIPE_SECRET_KEY,",
+      "tests": [
+        "Assert that config.stripeKey is loaded from the environment and not a string literal in tests by checking it matches process.env.STRIPE_SECRET_KEY.",
+        "Add a Stripe client initialization check that validates the key format (starts with sk_) without logging its value."
+      ]
+    }
+  },
+
+  "SEC-001:config/secrets.js:7": {
+    "how": "jwtSecret on line 7 is assigned the short string 'mysupersecretjwtkey123' as a literal. JWT signatures are only as strong as the secrecy and entropy of the signing key. A hardcoded, low-entropy string in source code makes every JWT issued by this application forgeable by anyone who reads the file.",
+    "why": "Confirmed detection: a string literal was found assigned to jwtSecret. Inferred risk: the detected value 'mysupersecretjwtkey123' is short and contains predictable patterns, making it vulnerable to brute-force attacks independent of the source exposure. An attacker who obtains this key can forge arbitrary JWT tokens and impersonate any user, including admins.",
+    "impact": "Every authenticated route that verifies a JWT signed with this key is affected. If isAdmin or role claims are encoded in the JWT payload, a forged token can grant full admin access. All active user sessions become untrustworthy once the key is known.",
+    "fix": {
+      "remediation": "Replace with process.env.JWT_SECRET. Generate a cryptographically random secret of at least 256 bits: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\". Store it only in environment variables, never in source. Invalidate all active sessions after rotation by changing the key.",
+      "codeChange": "jwtSecret: process.env.JWT_SECRET,",
+      "tests": [
+        "Write a test that attempts to verify a JWT signed with a different key and asserts it fails — confirms the verification logic is not bypassed.",
+        "Assert that process.env.JWT_SECRET has at least 32 characters in the startup check."
+      ]
+    }
+  },
+
+  "API-001:routes/orders.js:9": {
+    "how": "On line 9 of routes/orders.js, the handler destructures isAdmin directly from req.body: const { userId, items, isAdmin } = req.body. On line 11, if (isAdmin) is used to branch into admin-only order creation logic that sets order total to zero. Any HTTP client can send { \"isAdmin\": true } in the POST /orders request body — there is no server-side session check, role lookup, or token verification before this branch is taken.",
+    "why": "Confirmed detection: isAdmin was found destructured from req.body and used in a conditional on the same code path. Static analysis cannot confirm whether a separate auth middleware validates this claim upstream, but no such check is visible in this file. The pattern of trusting a client-supplied privilege field without server-side verification is a well-known privilege escalation vector.",
+    "impact": "POST /orders is the affected route. The admin branch calls OrderService.createAdminOrder which sets total to 0 for any order. Any user who discovers this field can place orders at no cost. The api-route and controller layers are directly affected; the service layer receives the escalated call without further validation.",
+    "fix": {
+      "remediation": "Never read privilege claims from the request body. Derive isAdmin from the authenticated session: verify a JWT or session token and look up the user's role from the database. The route body should contain only order data (userId, items); the authorization decision belongs in middleware or a dedicated authz check before the handler runs.",
+      "codeChange": "// Replace req.body.isAdmin with a server-side lookup:\nconst user = await getUserFromSession(req);\nif (user.role === 'admin') { ... }",
+      "tests": [
+        "Write an integration test that sends POST /orders with { isAdmin: true } as a non-admin user and asserts the response is 403 Forbidden, not an admin order.",
+        "Write a test that sends POST /orders without authentication and asserts it returns 401."
+      ]
+    }
+  },
+
+  "ERR-001:routes/orders.js:22": {
+    "how": "The handler for GET /orders/summary is declared as async on line 22. Inside the handler, await OrderService.getAllOrders() and await OrderService.getUserForOrder() are called without a try/catch block. If either promise rejects — for example, due to a database connection failure or query error — the rejection propagates out of the async function unhandled. In Node.js Express routes, an unhandled promise rejection does not automatically send an error response to the client; instead, the request hangs until a timeout or the process emits an unhandledRejection event.",
+    "why": "Confirmed detection: a router.get async handler was found in a file that contains await calls and no try/catch block. The detected absence of try/catch is a structural property of the file. Inferred risk: without error handling, a database failure will leave the HTTP connection open and may crash the Node.js process in environments without an unhandledRejection safety net.",
+    "impact": "The GET /orders/summary endpoint is directly affected. If the database is unavailable or returns an error, clients receive no response (or a connection reset) rather than a meaningful error message. Repeated failures will exhaust the server's request queue. The user-request and api-route layers are affected; errors from the service and database layers have no interception point.",
+    "fix": {
+      "remediation": "Wrap the async handler body in try/catch and return a structured error response on failure.",
+      "codeChange": "router.get('/summary', async (req, res) => {\n  try {\n    const orders = await OrderService.getAllOrders();\n    // ...\n    res.json(results);\n  } catch (err) {\n    res.status(500).json({ error: 'Failed to fetch order summary' });\n  }\n});",
+      "tests": [
+        "Mock OrderService.getAllOrders to reject with an error and assert the route returns HTTP 500 with a JSON error body.",
+        "Mock OrderService.getUserForOrder to reject mid-loop and assert the route does not hang — it returns an error response."
+      ]
+    }
+  },
+
+  "ERR-001:routes/products.js:6": {
+    "how": "The handler for GET /products is declared async on line 6 of routes/products.js. It calls await ProductService.getAllProducts() with no surrounding try/catch. If the database query rejects, the async function throws and the promise returned by the handler rejects without Express catching it. The client receives no response.",
+    "why": "Confirmed detection: an async route handler was found with await calls and no try/catch in this file. Inferred risk: database errors are expected in production (connection loss, query timeout, schema mismatch). Without a catch block, these errors are not recoverable at the route level and will surface as hung connections or process crashes.",
+    "impact": "GET /products is the affected endpoint. All clients listing products will receive no response if the database fails. The api-route layer has no error boundary; error propagation terminates at the Node.js event loop rather than at a controlled response point.",
+    "fix": {
+      "remediation": "Add try/catch to both handlers in routes/products.js.",
+      "codeChange": "router.get('/', async (req, res) => {\n  try {\n    const products = await ProductService.getAllProducts();\n    res.json(products);\n  } catch (err) {\n    res.status(500).json({ error: 'Failed to load products' });\n  }\n});",
+      "tests": [
+        "Mock ProductService.getAllProducts to reject and assert GET /products returns HTTP 500 with a JSON body.",
+        "Assert that GET /products/:id also returns HTTP 500 (not a hang) when ProductService.getProduct rejects."
+      ]
+    }
+  },
+
+  "SEC-002:routes/users.js:9": {
+    "how": "On line 9 of routes/users.js, the username query parameter is taken directly from req.query and concatenated into a SQL string: \"SELECT * FROM users WHERE username = '\" + username + \"'\". This string is passed to db.all() without parameterization. A request to GET /users/search?username=' OR '1'='1 would produce the query SELECT * FROM users WHERE username = '' OR '1'='1', which returns all rows. A request with username='; DROP TABLE users;-- would attempt to execute a destructive statement.",
+    "why": "Confirmed detection: a SQL keyword followed by string concatenation with a variable was found on line 9. The concatenated value originates from req.query, which is fully attacker-controlled. SQL injection via string concatenation is a critical vulnerability — it allows reading, modifying, or deleting arbitrary database data depending on the SQL dialect and user permissions.",
+    "impact": "The GET /users/search route is the injection point. The database connection in db/connection.js is shared across all routes, so a successful injection could affect the entire database, not only the users table. The full path from user-request through api-route, controller, service, to database is in scope — data integrity and confidentiality at every layer are at risk.",
+    "fix": {
+      "remediation": "Use parameterized queries exclusively. SQLite3's db.all accepts a second argument for bound parameters — use ? placeholders and pass values in the array, never in the string.",
+      "codeChange": "const query = 'SELECT * FROM users WHERE username = ?';\ndb.all(query, [username], (err, rows) => { ... });",
+      "tests": [
+        "Write a test that passes username=\"' OR '1'='1\" and asserts the response contains zero rows and no error — confirms the parameterized query treats it as a literal string.",
+        "Write a test with username=\"valid_user\" and assert it returns only the matching row — confirms parameterization does not break normal functionality."
+      ]
+    }
+  },
+
+  "ERR-001:routes/users.js:18": {
+    "how": "The handler for GET /users/:id on line 18 is async and calls await getUserById(req.params.id) with no try/catch. The getUserById function returns a Promise that rejects when the SQLite callback receives an error. If the database is unavailable or the id parameter causes a query failure, the rejection propagates out of the route handler unhandled. Express does not catch rejected async promises automatically in Express 4.",
+    "why": "Confirmed detection: async route handler with await and no try/catch detected in this file. Inferred risk: the id parameter comes from the URL and is passed to a database query. While the query uses a parameterized placeholder (? on line 25), a connection failure or unexpected value could still cause a rejection. Without a catch block, this leaves the connection open and the error invisible to the caller.",
+    "impact": "GET /users/:id is affected. Callers receive no response on database error. The api-route and user-request layers are impacted; the service layer's error propagates silently to the top-level Node.js error handler rather than to the client.",
+    "fix": {
+      "remediation": "Wrap the await call in try/catch.",
+      "codeChange": "router.get('/:id', async (req, res) => {\n  try {\n    const user = await getUserById(req.params.id);\n    if (!user) return res.status(404).json({ error: 'User not found' });\n    res.json(user);\n  } catch (err) {\n    res.status(500).json({ error: 'Failed to fetch user' });\n  }\n});",
+      "tests": [
+        "Mock the database to reject on db.get and assert GET /users/123 returns HTTP 500 with a JSON error body.",
+        "Test GET /users/nonexistent-id and assert it returns HTTP 404 rather than null or undefined."
+      ]
+    }
+  },
+
+  "PERF-001:routes/orders.js:27": {
+    "how": "In the GET /orders/summary handler, getAllOrders() first fetches all rows from the orders table with a single query. The results are then iterated in a for...of loop starting at line 26. On line 27, getUserForOrder(order.userId) issues a separate SELECT to the users table for each order. If there are N orders, this produces N+1 database queries: one to fetch all orders, then one per order to fetch the associated user. Each await inside the loop is sequential — they do not run in parallel.",
+    "why": "Confirmed detection: an await call matching a getUserForOrder/DB pattern was found inside a for loop in a file containing for...of. The N+1 query pattern is a well-documented performance antipattern. At small data volumes it is invisible; at scale (hundreds of orders) each request generates hundreds of sequential round-trips to the database, multiplying latency linearly with the result set size.",
+    "impact": "GET /orders/summary response time grows linearly with the number of orders. The database layer receives N queries per request instead of one. At high traffic, this can exhaust the database connection pool. The api-route, controller, service, and database layers are all in the affected path.",
+    "fix": {
+      "remediation": "Replace the loop-per-query pattern with a single JOIN query that fetches orders and their associated users in one round-trip. Alternatively, collect all userIds first, fetch them in a single IN(...) query, then assemble the result in memory.",
+      "codeChange": "// Option A: JOIN in a single query\nconst query = `\n  SELECT orders.*, users.id as userId, users.name, users.email\n  FROM orders\n  LEFT JOIN users ON orders.userId = users.id\n`;\n\n// Option B: batch fetch then merge\nconst userIds = [...new Set(orders.map(o => o.userId))];\nconst users = await getUsersByIds(userIds); // single IN query\nconst userMap = Object.fromEntries(users.map(u => [u.id, u]));\nconst results = orders.map(o => ({ ...o, user: userMap[o.userId] }));",
+      "tests": [
+        "Write a test that seeds 50 orders and spies on the database call count — assert db.get or getUserForOrder is called exactly once (JOIN) or twice (batch), not 51 times.",
+        "Benchmark GET /orders/summary response time with 100 rows and assert it completes within an acceptable threshold (e.g. < 200ms)."
+      ]
+    }
+  },
+
+  "LOGIC-001:services/orderService.js:3": {
+    "how": "The pattern match was triggered on line 3 of services/orderService.js, which is a comment describing the loose equality issue. The actual == operator is on line 8: if (discountCode == validCode). JavaScript's == operator performs type coercion before comparison. The string 'SAVE20' coerces to NaN, so no numeric value will accidentally match it — however, the risk is in the reverse direction: a caller passing null, undefined, false, 0, or an empty string as discountCode will be compared loosely against 'SAVE20'. While these do not match 'SAVE20', any future refactor that changes validCode to a falsy value (e.g. an empty string or 0) would silently allow all discountCodes to match.",
+    "why": "Confirmed detection: == was found in the applyDiscount function comparing a parameter against a string constant. The use of == instead of === introduces type coercion that is unnecessary and makes the comparison's behaviour non-obvious. Relying on == for business logic (discount eligibility, access control, pricing) is higher risk than in non-critical comparisons because the cost of a silent mismatch is a financial impact.",
+    "impact": "The applyDiscount function in services/orderService.js is the affected location. It is called on the order processing path, which flows through the api-route, controller, and service layers. An incorrect comparison result here directly affects order totals. No callers of applyDiscount are visible in the scanned files beyond orderService.js itself.",
+    "fix": {
+      "remediation": "Replace == with ===. This eliminates type coercion entirely and makes the intent explicit: the discount code must be exactly the string 'SAVE20', nothing else.",
+      "codeChange": "if (discountCode === validCode) {",
+      "tests": [
+        "Write a unit test for applyDiscount that passes discountCode = null and asserts the order total is NOT discounted.",
+        "Write a unit test that passes discountCode = 'SAVE20' and asserts the total is reduced by 20%, and one that passes 'save20' (wrong case) and asserts no discount is applied."
+      ]
+    }
+  },
+
+  "ERR-001:routes/users.js:19": {
+    "how": "The handler for GET /users/:id is declared async on line 19 of routes/users.js. It calls await getUserById(req.params.id) with no try/catch block. If getUserById rejects — for example, due to a database connection failure — the rejection propagates out of the async function unhandled. Express 4 does not automatically catch rejected async route handlers.",
+    "why": "Confirmed detection: an async route handler with await and no try/catch was found in this file. Inferred risk: a database failure or unexpected value will leave the HTTP connection open with no response sent to the client, and may surface as an unhandledRejection event in the Node.js process.",
+    "impact": "GET /users/:id is the affected endpoint. Clients receive no response on error. The user-request and api-route pipeline layers are impacted — errors from the database layer have no interception point before reaching the top-level Node.js error handler.",
+    "fix": {
+      "remediation": "Wrap the await call in try/catch and return a structured error response on failure.",
+      "codeChange": "router.get('/:id', async (req, res) => {\n  try {\n    const user = await getUserById(req.params.id);\n    if (!user) return res.status(404).json({ error: 'User not found' });\n    res.json(user);\n  } catch (err) {\n    res.status(500).json({ error: 'Failed to fetch user' });\n  }\n});",
+      "tests": [
+        "Mock the database to reject on db.get and assert GET /users/123 returns HTTP 500 with a JSON error body.",
+        "Test GET /users/nonexistent-id and assert it returns HTTP 404 rather than null or undefined."
+      ]
+    }
+  },
+
+  "LOG-001:index.js:13": {
+    "how": "Line 13 of index.js calls console.log('Sample app running on port 4000') inside the app.listen callback. This executes every time the server process starts, writing the port number to stdout. In production, stdout is captured by the host's log aggregator. While this specific call is a startup message, its presence in committed code establishes a convention that normalises console.log usage throughout the codebase.",
+    "why": "Confirmed detection: console.log found in the server entry point. The detected call is a startup message with no sensitive content, which is low-risk in isolation. Inferred risk: a codebase that contains console.log at the top level sends a signal that this logging method is acceptable — developers follow existing patterns, making it more likely that debug console.log calls added during feature work will reach production and leak sensitive data.",
+    "impact": "Direct impact is a single startup log line per process launch. The indirect impact is the convention it establishes: other LOG-001 findings in this codebase (in service and route files) leak user IDs and request payloads through the same stdout channel, and they follow the same pattern seen here.",
+    "fix": {
+      "remediation": "Replace console.log with a structured logger (pino or winston) with a log level controlled by the LOG_LEVEL environment variable. Set LOG_LEVEL=warn in production so all info/debug output is suppressed without code changes across any file.",
+      "codeChange": "// Replace:\napp.listen(4000, () => console.log('Sample app running on port 4000'));\n// With:\napp.listen(4000, () => logger.info({ port: 4000 }, 'Server started'));",
+      "tests": [
+        "Spy on console.log in a server startup integration test and assert it is never called — confirms the structured logger replacement is in effect.",
+        "Add an ESLint no-console rule to the project configuration and assert zero violations in CI."
+      ]
+    }
+  },
+
+  "LOG-001:services/orderService.js:19": {
+    "how": "On line 19 of services/orderService.js, the createOrder function calls console.log('createOrder called for userId:', userId). This executes on every order creation request, writing the caller's userId to the process stdout stream. In production, stdout is captured by log aggregators (CloudWatch, Datadog, Splunk), making internal user identifiers visible in log storage and to anyone with log read access.",
+    "why": "Confirmed detection: console.log was found inside the createOrder service function, directly logging userId. Debug log statements in service-layer code expose internal identifiers to log storage systems and everyone with log access. Inferred risk: userId values in logs, combined with timestamp and order data in surrounding log entries, can enable re-identification of individuals in contexts where that data should be pseudonymised.",
+    "impact": "Every call to createOrder emits userId to server logs. The api-route, controller, and service layers are all in the affected path. If logs are aggregated in a third-party system, userId leakage extends beyond the application's own infrastructure.",
+    "fix": {
+      "remediation": "Remove console.log from production service code. For debug tracing that is legitimately needed in development, use a structured logger at 'debug' level and ensure LOG_LEVEL=warn or above in production so these calls are suppressed by configuration.",
+      "codeChange": "// Remove:\n// console.log('createOrder called for userId:', userId);\n// Or replace with level-gated structured logging:\n// logger.debug({ userId }, 'createOrder called');",
+      "tests": [
+        "Spy on console.log in a unit test for createOrder and assert it is never called during normal execution.",
+        "Write a test that sets LOG_LEVEL=warn and asserts no debug output is emitted during a full order creation flow."
+      ]
+    }
+  },
+
+  "SYNC-001:services/orderService.js:5": {
+    "how": "Line 5 of services/orderService.js calls fs.readFileSync('./config/promos.json', 'utf8') at module scope — outside any function, at the top level of the file. This executes synchronously when the module is first required. Node.js's event loop is blocked for the entire duration of the file-system read; no other callbacks, timers, or incoming HTTP requests can be processed during this window.",
+    "why": "Confirmed detection: fs.readFileSync found at module scope in a service file. Synchronous file I/O blocks the Node.js event loop. While a one-time startup read of a small config file can be acceptable if it occurs before app.listen(), loading it inside a lazily-required module means the block can happen mid-request on the first request after a cold start.",
+    "impact": "Any in-flight HTTP request active when orderService.js is first loaded will be delayed by the file read. On a slow or network-mounted filesystem this can add tens to hundreds of milliseconds to one request and queue all others. The service and controller layers are directly affected; the database and api-route layers are indirectly affected through request queuing.",
+    "fix": {
+      "remediation": "Move configuration loading to an async initialisation function called at application startup before app.listen(). Pass the loaded config into the service as a parameter rather than reading it inline.",
+      "codeChange": "// Before app.listen() in index.js:\nconst promoConfig = JSON.parse(\n  await fs.promises.readFile('./config/promos.json', 'utf8')\n);\n// Inject into service:\nconst orderService = require('./services/orderService')(promoConfig);",
+      "tests": [
+        "Mock fs.readFileSync to throw and assert orderService still loads without crashing — confirms the dependency is injected rather than read inline.",
+        "Write a performance test asserting that requiring orderService takes under 5ms on a warm cache — detects accidental synchronous I/O regressions."
+      ]
+    }
+  },
+
+  "LOG-001:index.js:8": {
+    "how": "Line 8 of index.js calls console.log inside the app.listen callback, printing the server port to stdout on every process start. This is a development-era startup diagnostic retained in the committed codebase. In production, the same stdout channel receives all console output from every module — route handlers, services, middleware — so retaining console.log here legitimises its use project-wide.",
+    "why": "Confirmed detection: console.log found in the server entry point. The detected call logs a port number with no sensitive content, which is low-severity in isolation. Inferred risk: a codebase that accepts console.log at the entry point tends to accumulate console.log calls in request handlers and service functions during development — as seen in the companion LOG-001 findings in routes and service files in this project.",
+    "impact": "Direct impact is limited to a single startup message per process launch. The broader impact is the pattern it establishes: other parts of this codebase use the same pattern to log user emails, request payloads, and user IDs, all visible in the same log stream.",
+    "fix": {
+      "remediation": "Replace console.log with a structured logger (pino or winston) whose output level is controlled by the LOG_LEVEL environment variable. Set LOG_LEVEL=warn in production to suppress all informational output across every file without code changes.",
+      "codeChange": "const logger = require('pino')();\napp.listen(port, () => logger.info({ port }, 'Server started'));",
+      "tests": [
+        "Assert console.log is not called during server startup by spying on it in an integration test.",
+        "Assert that setting LOG_LEVEL=warn suppresses the startup message — confirms environment-level log control works."
+      ]
+    }
+  },
+
+  "LOG-001:routes/posts.js:34": {
+    "how": "Line 34 of routes/posts.js calls console.log('Creating new post:', req.body) inside the POST /posts request handler. This executes on every post creation request, writing the complete request body — which includes the post title, content, author ID, tags, and any other client-supplied fields — to the server's stdout stream, which is collected by production log aggregators.",
+    "why": "Confirmed detection: console.log found inside a POST route handler, logging req.body directly. The full request body is written to logs on every request. Inferred risk: post bodies can contain personally identifiable information (author name, draft content, metadata) that should not appear in log storage. Depending on content moderation requirements, unpublished post content in logs may also create compliance obligations.",
+    "impact": "Every POST /posts request causes the complete req.body to be written to the log stream. The user-request and api-route layers are directly affected. If logs are retained by a third-party aggregator, post content and author data persist in that system according to its retention policy — potentially beyond the application's own data retention controls.",
+    "fix": {
+      "remediation": "Remove req.body from console.log. If request tracing is needed for debugging, log only a non-sensitive summary after the operation completes — for example, the generated post ID — using a structured logger at debug level.",
+      "codeChange": "// Remove:\n// console.log('Creating new post:', req.body);\n// If tracing is needed post-creation:\n// logger.debug({ postId: newPost.id }, 'Post created');",
+      "tests": [
+        "Spy on console.log in a unit test for the POST /posts handler and assert it is never called.",
+        "Assert that req.body contents do not appear in any captured log output during an end-to-end post creation test."
+      ]
+    }
+  },
+
+  "SYNC-001:services/postService.js:5": {
+    "how": "Line 5 of services/postService.js calls fs.readFileSync('./config/post-template.txt', 'utf8') at module scope. This synchronous file read executes when the module is first required — which happens on the first request that reaches a route importing postService. The Node.js event loop is fully blocked for the duration of the I/O operation; all pending callbacks and incoming requests are queued behind it.",
+    "why": "Confirmed detection: fs.readFileSync found at module scope in a service file. Synchronous file reads in a Node.js server block the single-threaded event loop for every concurrent user during the cold-load. Inferred risk: if the config file is on a slow or network-mounted filesystem, or if the file grows in size, this single synchronous call introduces request latency spikes that are difficult to attribute during debugging.",
+    "impact": "The first request that loads postService.js blocks all other in-flight requests for the duration of the file read. Routes that import postService — GET /posts and POST /posts — are in the affected path. The service and api-route layers are directly affected.",
+    "fix": {
+      "remediation": "Load the template asynchronously at application startup and inject it into postService as a constructor argument. Use fs.promises.readFile in an async init function called before app.listen().",
+      "codeChange": "// index.js (before app.listen):\nconst template = await fs.promises.readFile('./config/post-template.txt', 'utf8');\nconst postService = require('./services/postService')(template);\n\n// postService.js — export a factory:\nmodule.exports = function(postTemplate) { /* ... */ };",
+      "tests": [
+        "Mock fs.readFileSync to throw ENOENT and assert the server startup catches the error gracefully rather than crashing mid-request.",
+        "Write a test that instantiates postService with an injected template string and asserts it works without accessing the filesystem."
+      ]
+    }
+  },
+
+  "SYNC-001:services/userService.js:5": {
+    "how": "Line 5 of services/userService.js calls fs.readFileSync('./config/permissions.json', 'utf8') at module scope. The permissions matrix loaded here is used by all downstream authorisation checks in the auth service. This synchronous read executes when userService is first required, which occurs on the first authenticated request. The event loop is blocked for the full I/O duration, queuing all other pending work.",
+    "why": "Confirmed detection: fs.readFileSync found at module scope in the userService file. The permissions.json file determines which roles can access which resources; loading it synchronously means any I/O latency in that read directly delays every other concurrent request. Inferred risk: in containerised environments where config files may be mounted from remote volumes, a network hiccup during this read can stall the entire server.",
+    "impact": "Every cold-load of userService.js blocks the Node.js event loop. Since userService handles authentication and authorisation, nearly every authenticated route passes through it. A slow permission-file read blocks the api-route, middleware, and service layers simultaneously.",
+    "fix": {
+      "remediation": "Load permissions.json at application startup before app.listen() and pass the parsed object into userService as a dependency. For JSON files, Node.js's require() is synchronous but cached — acceptable at startup before the event loop is handling requests.",
+      "codeChange": "// index.js (before app.listen):\nconst permissions = require('./config/permissions.json'); // cached after first load\nconst userService = require('./services/userService')(permissions);\n\n// userService.js:\nmodule.exports = function(permissionMatrix) {\n  return { checkPermission(role, action) { return permissionMatrix[role]?.includes(action); } };\n};",
+      "tests": [
+        "Assert userService.checkPermission returns the correct boolean for known role/action pairs using an injected test permission matrix — no filesystem access required.",
+        "Write an integration test asserting the server is ready to accept requests within 500ms — detects slow synchronous I/O at startup."
+      ]
+    }
+  },
+
+  "LOG-001:services/userService.js:22": {
+    "how": "Line 22 of services/userService.js calls console.log('Issuing token for:', user && user.email) inside the token-issuance function. This executes on every successful login, writing the authenticating user's email address to stdout. In production, stdout is captured by log aggregators and persisted according to their retention policies — which may be 30–90 days or longer.",
+    "why": "Confirmed detection: console.log found inside the token-issuance path, logging user.email directly. Email addresses are personally identifiable information (PII) subject to GDPR, CCPA, and similar data protection regulations. Logging PII without explicit consent or a documented legitimate interest basis can create compliance obligations and, if the log store is breached, constitutes a notifiable data breach.",
+    "impact": "Every successful login writes the authenticating user's email to the log stream. The user authentication path — api-route, middleware, and service layers — is in the affected path. Log retention policies may store this PII for extended periods, and log aggregators accessible to operators or third-party vendors extend the exposure surface.",
+    "fix": {
+      "remediation": "Remove user.email from all log output. If authentication audit logging is required for compliance, log only a non-PII token (e.g. a hashed user ID or an opaque audit correlation ID) at the appropriate log level, ensuring the logging destination meets your data residency requirements.",
+      "codeChange": "// Remove:\n// console.log('Issuing token for:', user && user.email);\n// If audit logging is required:\n// logger.info({ userId: user.id }, 'Token issued'); // no email, no PII",
+      "tests": [
+        "Spy on console.log in a unit test for the token-issuance function and assert it is never called with any argument containing '@' — confirms no email logging.",
+        "Perform a full login flow in an integration test and assert no PII (email pattern) appears in any captured log output."
+      ]
+    }
+  },
+
+  "INPUT-001:routes/users.js:13": {
+    "how": "If a route passes req.body, req.query, or req.params directly into res.send() or res.render(), any HTML or script tags in the user-supplied value are sent to the client unescaped. In a JSON API this is usually benign, but if the Content-Type is text/html or the value is interpolated into a server-rendered template, the browser will execute the injected script in the origin's context.",
+    "why": "Confirmed detection: req.body/query/params was found fed directly into res.send/render without intermediate sanitisation. Even in JSON-only APIs, reflected unsanitised input can cause issues when logs, error pages, or admin dashboards render the value without escaping.",
+    "impact": "Any endpoint that reflects unsanitised user input into the HTTP response is a potential XSS vector. The user-request and api-route layers are directly affected. If an admin UI or log viewer renders these responses, the attack surface extends beyond the API itself.",
+    "fix": {
+      "remediation": "Never pass req.body/query/params directly to res.send or res.render. For JSON APIs, serialize data through a known schema (e.g. pick only expected fields). For HTML responses, use a template engine with auto-escaping enabled (e.g. EJS with <%=, not <%-) or sanitise with DOMPurify / sanitize-html before rendering.",
+      "codeChange": "// Instead of: res.send(req.query.message)\n// Use: res.json({ message: sanitize(req.query.message) })\n// Or validate/strip HTML: const safe = validator.escape(req.query.message);",
+      "tests": [
+        "Send a request with a value containing <script>alert(1)</script> and assert the response does not include the raw script tag.",
+        "Assert that all API responses use Content-Type: application/json — prevents browsers from parsing HTML in JSON responses."
+      ]
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "sample-ecommerce-api-fixed",
+  "version": "1.0.0",
+  "description": "Fixed version of the sample project — SEC-002 and LOGIC-001 resolved",
+  "main": "index.js"
+}

@@ -1,0 +1,18 @@
+{
+  "name": "codepulse-server",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "jest --testPathPattern=tests/",
+    "test:watch": "jest --testPathPattern=tests/ --watch"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}
