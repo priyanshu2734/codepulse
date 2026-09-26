@@ -1,55 +1,11 @@
 # CodePulse
 
-> CodePulse helps developers find, understand, trace, and fix application issues by combining automated code analysis, AI explanations, and interactive application visualization.
+> AI-powered application issue explorer. CodePulse scans a codebase, detects bugs, security flaws, and performance issues, explains *why* they matter using grounded code evidence, and visualizes their impact across your application — not just a list of warnings.
 
-## Stack
+Built as a submission for the **IBM Bob 2.0 Hackathon**, using Bob IDE as the core development tool (see [`bob_sessions/`](./bob_sessions) for full session history and proof of work).
 
-- **Frontend:** React 18 + Vite (port 5173)
-- **Backend:** Node.js + Express (port 3001)
+---
 
-## Setup
+## What it does
 
-<!-- TODO: fill in once dependencies are installed -->
-
-```bash
-# Install all dependencies
-npm install          # root (concurrently)
-npm install --prefix server
-npm install --prefix client
-
-# Run both servers with one command
-npm run dev
-```
-
-## Architecture
-
-```
-Repository → Analyzer → Findings + Relationships → AI Explanation → Dashboard + Graph
-```
-
-| Folder | Responsibility |
-|--------|---------------|
-| `server/routes/` | Express API routes |
-| `server/analyzer/` | File reading + pattern checks |
-| `server/ai/` | AI explanation layer (grounded in analyzer output) |
-| `server/graph/` | Converts relationships into graph nodes and edges |
-| `client/src/pages/` | Dashboard, Issue Explorer, Graph View |
-| `client/src/components/` | Sidebar, TopBar |
-
-## Issue Categories (MVP)
-
-Bugs & Logic · Error Handling · Security · API & Data Flow · Performance
-
-## API
-
-| Method | Route | Description |
-|--------|-------|-------------|
-| GET | `/api/scan` | Run analysis; returns `{ findings: [] }` |
-
-## Usage
-
-<!-- TODO: add demo scenario steps -->
-
-## Roadmap
-
-<!-- TODO: fill in after hackathon -->
+CodePulse follows one continuous pipeline:
