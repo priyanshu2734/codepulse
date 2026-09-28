@@ -4,7 +4,7 @@
 
 CodePulse is a lightweight issue explorer for JavaScript/TypeScript codebases. It scans a project, flags a focused set of security, logic, error-handling, API/data-flow, and performance issues, and helps you understand each one — not just where it is, but the evidence behind it, where it sits in the application flow, and how to fix it.
 
-**🔗 Live demo:** [Add your deployed URL here]
+**🔗 Live demo:** [**https://codepulse-r0yr.onrender.com**]
 
 Built for the **IBM Bob 2.0 Hackathon**. Development sessions are in [`bob_sessions/`](./bob_sessions).
 
